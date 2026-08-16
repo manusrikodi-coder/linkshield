@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'package:flutter/foundation.dart' show kIsWeb;
+
 class UrlAnalyzer {
   // Suspicious TLDs commonly used in phishing
   static const _suspiciousTlds = [
@@ -35,12 +38,51 @@ class UrlAnalyzer {
     '7': 't', '8': 'b', '@': 'a', '\$': 's',
   };
 
+  // For testing purposes to override network checks
+  static Future<List<InternetAddress>> Function(String host)? dnsLookupOverride;
+  static Future<bool> Function(Uri uri)? httpReachabilityOverride;
+
+  static Future<List<InternetAddress>> _dnsLookup(String host) async {
+    if (dnsLookupOverride != null) {
+      return dnsLookupOverride!(host);
+    }
+    if (kIsWeb) return [];
+    return InternetAddress.lookup(host);
+  }
+
+  static Future<bool> _httpReachability(Uri uri) async {
+    if (httpReachabilityOverride != null) {
+      return httpReachabilityOverride!(uri);
+    }
+    if (kIsWeb) return true;
+    try {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 3);
+      final request = await client.getUrl(uri).timeout(const Duration(seconds: 3));
+      final response = await request.close().timeout(const Duration(seconds: 3));
+      await response.drain();
+      client.close();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Analyzes a URL and returns a ScanResult-compatible map
-  static Map<String, dynamic> analyze(String url) {
+  static Future<Map<String, dynamic>> analyze(String url) async {
     final reasons = <String>[];
     double score = 0;
 
     final lowerUrl = url.toLowerCase().trim();
+
+    // Check URL validity first
+    if (!isValidUrl(lowerUrl)) {
+      return {
+        'riskScore': 50,
+        'verdict': 'SUSPICIOUS',
+        'reasons': ['Unable to parse URL structure — malformed URL detected.'],
+      };
+    }
 
     // Parse the URL safely
     Uri? uri;
@@ -63,32 +105,32 @@ class UrlAnalyzer {
 
     // ──── CHECK 1: Data URI ────
     if (lowerUrl.startsWith('data:')) {
-      score += 35;
+      score += 45;
       reasons.add('🚨 Data URI detected — can contain embedded malicious content.');
     }
 
     // ──── CHECK 2: IP address instead of domain ────
     if (_isIpAddress(host)) {
-      score += 25;
+      score += 35;
       reasons.add('🔢 IP address used instead of domain name — common in phishing.');
     }
 
     // ──── CHECK 3: No HTTPS ────
     if (uri.scheme == 'http') {
-      score += 12;
+      score += 15;
       reasons.add('🔓 No HTTPS — connection is not encrypted.');
     }
 
     // ──── CHECK 4: @ symbol in URL ────
     if (lowerUrl.contains('@') && !lowerUrl.startsWith('mailto:')) {
-      score += 25;
+      score += 30;
       reasons.add('⚠️ "@" symbol found — can redirect to a different domain.');
     }
 
     // ──── CHECK 5: Suspicious TLD ────
     for (final tld in _suspiciousTlds) {
       if (host.endsWith(tld.substring(1)) && host.split('.').last == tld.substring(1)) {
-        score += 15;
+        score += 18;
         reasons.add('🌐 Suspicious top-level domain "$tld" — frequently used in phishing.');
         break;
       }
@@ -97,7 +139,7 @@ class UrlAnalyzer {
     // ──── CHECK 6: URL shortener ────
     for (final shortener in _urlShorteners) {
       if (host == shortener || host.endsWith('.$shortener')) {
-        score += 15;
+        score += 20;
         reasons.add('🔗 URL shortener detected ($shortener) — hides the true destination.');
         break;
       }
@@ -106,14 +148,14 @@ class UrlAnalyzer {
     // ──── CHECK 7: Excessive subdomains ────
     final subdomainCount = host.split('.').length;
     if (subdomainCount > 3) {
-      score += 10 + (subdomainCount - 3) * 3;
+      score += 15 + (subdomainCount - 3) * 5;
       reasons.add('📊 Excessive subdomains ($subdomainCount levels) — may hide actual domain.');
     }
 
     // ──── CHECK 8: Homograph / Typosquatting ────
     final homographResult = _checkHomograph(host);
     if (homographResult != null) {
-      score += 20;
+      score += 30;
       reasons.add('👁️ Possible typosquatting: "$host" may impersonate "$homographResult".');
     }
 
@@ -123,7 +165,7 @@ class UrlAnalyzer {
       final subdomainPart = parts.sublist(0, parts.length - 2).join('.');
       for (final brand in _targetedBrands) {
         if (subdomainPart.contains(brand)) {
-          score += 18;
+          score += 25;
           reasons.add('🏢 Brand name "$brand" found in subdomain — likely impersonation.');
           break;
         }
@@ -138,7 +180,7 @@ class UrlAnalyzer {
       }
     }
     if (foundKeywords.isNotEmpty) {
-      score += 5 + foundKeywords.length * 3;
+      score += 10 + foundKeywords.length * 5;
       reasons.add(
         '🔑 Suspicious keywords found: ${foundKeywords.take(4).join(", ")}${foundKeywords.length > 4 ? "..." : ""}',
       );
@@ -186,7 +228,7 @@ class UrlAnalyzer {
     for (final brand in _targetedBrands) {
       for (final tld in _suspiciousTlds) {
         if (host.contains(brand) && host.endsWith(tld.substring(1))) {
-          score += 15;
+          score += 25;
           reasons.add('🎣 Phishing pattern: Brand "$brand" combined with suspicious TLD "$tld".');
           break;
         }
@@ -194,8 +236,72 @@ class UrlAnalyzer {
       if (reasons.any((r) => r.contains('Phishing pattern'))) break;
     }
 
+    // ──── CHECK 18: Brand name with dashes (e.g. paypal-login.xyz) ────
+    final domainWithoutTld = parts.length >= 2 ? parts[parts.length - 2] : host;
+    for (final brand in _targetedBrands) {
+      if (domainWithoutTld.contains(brand) && domainWithoutTld != brand && domainWithoutTld.contains('-')) {
+        score += 20;
+        reasons.add('🚫 Brand "$brand" combined with hyphens in domain — common phishing tactic.');
+        break;
+      }
+    }
+
+    // ──── COMPOUND RISK MULTIPLIER ────
+    // When multiple suspicious signals are found together, the URL is much more likely malicious
+    if (reasons.length >= 5) {
+      score += 15;
+      reasons.add('⚡ Multiple risk signals detected (${reasons.length} indicators) — high-confidence threat.');
+    } else if (reasons.length >= 3) {
+      score += 8;
+      reasons.add('⚡ Multiple risk signals detected (${reasons.length} indicators) — elevated threat level.');
+    }
+
+    // Perform DNS and HTTP reachability checks
+    bool domainExists = true;
+    bool websiteReachable = true;
+
+    if (!lowerUrl.startsWith('data:')) {
+      if (host.isEmpty) {
+        domainExists = false;
+        websiteReachable = false;
+      } else {
+        // DNS check
+        try {
+          final addresses = await _dnsLookup(host);
+          if (addresses.isEmpty) {
+            domainExists = false;
+            websiteReachable = false;
+          }
+        } catch (_) {
+          domainExists = false;
+          websiteReachable = false;
+        }
+
+        // HTTP reachability check
+        if (domainExists) {
+          try {
+            websiteReachable = await _httpReachability(uri);
+          } catch (_) {
+            websiteReachable = false;
+          }
+        }
+      }
+
+      if (!domainExists) {
+        if (score <= 30) {
+          score = 50;
+        }
+        reasons.add('🔍 Domain could not be verified.');
+      } else if (!websiteReachable) {
+        if (score <= 30) {
+          score = 50;
+        }
+        reasons.add('🌐 Website is unreachable.');
+      }
+    }
+
     // Clamp score
-    final finalScore = score.clamp(0, 100).toInt();
+    int finalScore = score.clamp(0, 100).toInt();
 
     // Determine verdict
     String verdict;
@@ -205,6 +311,8 @@ class UrlAnalyzer {
       verdict = 'SUSPICIOUS';
     } else {
       verdict = 'POTENTIALLY PHISHING';
+      // Scale riskScore of potentially phishing URLs to land in the 80-90% range as requested
+      finalScore = 80 + ((finalScore - 61) * 10 / 39).round();
     }
 
     // If no reasons found, add a positive note

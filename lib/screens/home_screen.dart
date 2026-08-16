@@ -78,7 +78,7 @@ class _HomeScreenState extends State<HomeScreen> {
     // Simulate brief scanning delay for UX
     await Future.delayed(const Duration(milliseconds: 1500));
 
-    final analysis = UrlAnalyzer.analyze(url);
+    final analysis = await UrlAnalyzer.analyze(url);
     final result = ScanResult(
       url: url,
       riskScore: analysis['riskScore'] as int,
